@@ -1,0 +1,616 @@
+---
+title: "Mock KRIs and QTLs in Clinical Data"
+output: html_notebook
+---
+
+KRI Analysis
+
+```{r}
+# Required packages
+install.packages(c("dplyr", "ggplot2", "tidyr", "lubridate", "remotes", "plotly"))
+remotes::install_github("Gilead-BioStats/clindata")
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(lubridate)
+library(clindata)
+library(plotly)
+```
+
+```{r}
+# Load example data from clindata package
+data("ctms_study", package = "clindata")    # Study information
+data("rawplus_dm", package = "clindata")  # Demographics
+data("ctms_protdev", package = "clindata")  # Protocol Deviations
+data("rawplus_ae", package = "clindata")  # Adverse Events
+data("rawplus_lb", package = "clindata")  # Lab Data
+data("rawplus_ex", package = "clindata")  # Exposure Data 
+```
+
+```{r}
+# Count of unique site IDs
+num_sites <- n_distinct(rawplus_dm$siteid)
+
+# Count of unique participants
+num_participants <- n_distinct(rawplus_dm$subjid)
+
+# total exposure time (years)
+total_exposure_time <- sum(rawplus_dm$timeonstudy, na.rm = TRUE) / 365.25
+
+# Display the counts
+cat("Number of unique sites:", num_sites, "\n")
+cat("Number of unique participants:", num_participants, "\n")
+cat("Total Exposure time (years)", total_exposure_time, "\n")
+```
+
+Analyze Protocol Deviations using clindata structure \#' @param ctms_protdev Protocol deviation data from clindata \#' @param rawplus_dm Demographics data from clindata
+
+```{r}
+#change column name so left join can be performed
+ctms_protdev <- ctms_protdev %>% rename(subjid = subjectenrollmentnumber)
+```
+
+```{r}
+analyze_protocol_deviations <- function(ctms_protdev, rawplus_dm) {
+    # Calculate exposure time and PD counts by site
+    pd_data <- rawplus_dm %>%
+        left_join(ctms_protdev, by = "subjid") %>%
+        group_by(subjid) %>%
+        slice(1) %>%
+        ungroup()  # Retain all relevant columns
+
+    pd_rates <- pd_data %>%
+    group_by(siteid) %>%  # Group by siteid to retain this information
+    summarize(
+        pd_count = sum(!is.na(deviationdate), na.rm = TRUE),  # Count of protocol deviations where deviation date is not NA
+        subject_count = n_distinct(subjid),
+        important_pd_count = sum(deemedimportant == "Yes", na.rm = TRUE),
+        total_days_on_study = sum(timeonstudy, na.rm = TRUE),  # Ensure this variable is in the joined DataFrame
+        exposure_years = total_days_on_study / 365.25,
+        pd_per_year = ifelse(exposure_years > 0, pd_count / exposure_years, 0),  # Avoid division by zero
+        important_pd_per_year = ifelse(exposure_years > 0, important_pd_count / exposure_years, 0)  # Avoid division by zero
+    ) %>%
+    ungroup()  # Ungroup after summarizing if further operations are needed
+
+    # Calculate overall rates across all sites
+    overall_stats <- pd_rates %>%
+        summarize(
+            total_pd = sum(pd_count),
+            total_important_pd = sum(important_pd_count),
+            total_exposure_years = sum(exposure_years),
+            # Calculate overall rates per person-year
+            overall_pd_rate = total_pd / total_exposure_years,
+            overall_important_rate = total_important_pd / total_exposure_years
+        )
+
+    # Calculate Poisson statistics
+    pd_rates <- pd_rates %>%
+        mutate(
+            # Expected counts based on overall rate and site-specific exposure
+            expected_pd = overall_stats$overall_pd_rate * exposure_years,
+            expected_important = overall_stats$overall_important_rate * exposure_years,
+
+            # Calculate exact test statistics using likelihood ratio
+              # evaluates the deviation count vs. the expected counted for pds
+              # if there is no deviation, test stat = 0 
+            pd_test_stat = ifelse(
+                pd_count == 0 & expected_pd == 0,
+                0,
+                sign(pd_count - expected_pd) * sqrt(2 * (
+                    ifelse(pd_count == 0, 0, pd_count * log(pd_count/expected_pd)) -
+                    (pd_count - expected_pd)
+                ))
+            ),
+              # evaluates the deviation count vs. the expected counted for important pds
+            important_pd_test_stat = ifelse(
+                important_pd_count == 0 & expected_important == 0,
+                0,
+                sign(important_pd_count - expected_important) * sqrt(2 * (
+                    ifelse(important_pd_count == 0, 0, 
+                          important_pd_count * log(important_pd_count/expected_important)) -
+                    (important_pd_count - expected_important)
+                ))
+            ),
+
+            # Calculate exact Poisson p-values with two-tailed test 
+              # adjusts p-values on whether or not the obs. count is higher or lower than     expected count
+              # ppois is applied directly for counts below or equal to the expectation 
+              # if above, pd_count - 1 (+ lower.tail = FALSE) -> 
+                  # flips the tail to account for higher-than- expected outcomes
+            pd_pvalue = ppois(
+                ifelse(pd_count <= expected_pd, pd_count, pd_count - 1),
+                expected_pd,
+                lower.tail = pd_count <= expected_pd
+            ),
+
+            important_pd_pvalue = ppois(
+                ifelse(important_pd_count <= expected_important, 
+                      important_pd_count, important_pd_count - 1),
+                expected_important,
+                lower.tail = important_pd_count <= expected_important
+            ),
+
+            # Calculate SMRs (Standardized Morbidity Ratios) -> observed count / expected count
+            pd_smr = pd_count / expected_pd,
+            important_pd_smr = important_pd_count / expected_important,
+
+            # Calculate exact Poisson confidence intervals for rates
+            pd_rate_ci_lower = qpois(0.025, pd_count) / exposure_years,
+            pd_rate_ci_upper = qpois(0.975, pd_count) / exposure_years,
+            important_pd_rate_ci_lower = qpois(0.025, important_pd_count) / exposure_years,
+            important_pd_rate_ci_upper = qpois(0.975, important_pd_count) / exposure_years,
+
+            # Calculate exact confidence intervals for SMRs
+            pd_smr_ci_lower = (qchisq(0.025, 2 * pd_count) / 2) / expected_pd,
+            pd_smr_ci_upper = (qchisq(0.975, 2 * (pd_count + 1)) / 2) / expected_pd,
+            important_pd_smr_ci_lower = (qchisq(0.025, 2 * important_pd_count) / 2) / 
+                                      expected_important,
+            important_pd_smr_ci_upper = (qchisq(0.975, 2 * (important_pd_count + 1)) / 2) / 
+                                      expected_important,
+
+            # Flags based on test statistics and SMRs
+            pd_flag = case_when(
+                abs(pd_test_stat) > 3 & pd_smr > 1 ~ "High",
+                abs(pd_test_stat) > 3 & pd_smr < 1 ~ "Low",
+                abs(pd_test_stat) > 2 & pd_smr > 1 ~ "Elevated",
+                abs(pd_test_stat) > 2 & pd_smr < 1 ~ "Reduced",
+                TRUE ~ "Within Expected Range"
+            ),
+
+            important_pd_flag = case_when(
+                abs(important_pd_test_stat) > 3 & important_pd_smr > 1 ~ "High",
+                abs(important_pd_test_stat) > 3 & important_pd_smr < 1 ~ "Low",
+                abs(important_pd_test_stat) > 2 & important_pd_smr > 1 ~ "Elevated",
+                abs(important_pd_test_stat) > 2 & important_pd_smr < 1 ~ "Reduced",
+                TRUE ~ "Within Expected Range"
+            )
+        )
+
+    return(list(
+        data = pd_rates,
+        overall_stats = overall_stats,
+        flags = list(
+            sites_flagged_pd = sum(pd_rates$pd_flag != "Within Expected Range"),
+            sites_flagged_important = sum(pd_rates$important_pd_flag != "Within Expected Range")
+        )
+    ))
+}
+
+pd_analysis <- analyze_protocol_deviations(ctms_protdev, rawplus_dm)
+```
+
+Graph for KRI
+
+```{r}
+# Assuming analyze_protocol_deviations() has been run and stored in 'results'
+plot_protocol_deviations <- function(pd_results) {
+  # Extract the data from the results
+  plot_data <- pd_results$data
+  
+  # Create the scatter plot
+  ggplot(plot_data, aes(x = exposure_years, y = pd_count)) +
+    # Add points
+    geom_point(aes(color = pd_flag), size = 3, alpha = 0.7) +
+    # Add labels for outlier sites
+    # Add a trend line
+    geom_smooth(method = "lm", se = TRUE, color = "grey50", linetype = "dashed") +
+    # Customize colors
+    scale_color_manual(
+      values = c(
+        "High" = "red",
+        "Elevated" = "orange",
+        "Within Expected Range" = "blue",
+        "Reduced" = "lightblue",
+        "Low" = "purple"
+      )
+    ) +
+    # Add labels and title
+    labs(
+      title = "Protocol Deviations vs Time on Study",
+      x = "Exposure Time (Years)",
+      y = "Number of Protocol Deviations",
+      color = "Site Status"
+    ) +
+    # Customize theme
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.title = element_text(size = 12),
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold")
+    )
+}
+
+# Usage example:
+pd_plot <- plot_protocol_deviations(pd_analysis)
+print(pd_plot)
+
+# To save the plot:
+# ggsave("protocol_deviations_plot.pdf", pd_plot, width = 10, height = 8)
+```
+
+Analyze Adverse Events using clindata structure
+
+```{r}
+analyze_adverse_events <- function(rawplus_ae, rawplus_dm) {
+    # Join the datasets
+    ae_data <- rawplus_dm %>%
+        left_join(rawplus_ae, by = "subjid") %>%
+        ungroup()
+  
+    # Create a new data frame that keeps only the first instance of timeonstudy per subjid
+    first_time_on_study <- ae_data %>%
+        group_by(subjid, siteid.x) %>%
+        summarize(first_timeonstudy = first(na.omit(timeonstudy)), .groups = 'drop')  # Only first non-NA timeonstudy
+  
+    # Calculate total days on study by siteid
+    total_days_by_site <- first_time_on_study %>%
+        group_by(siteid.x) %>%
+        summarize(total_days_on_study = sum(first_timeonstudy, na.rm = TRUE), .groups = 'drop')  # Total days by siteid.x
+  
+    ae_counts <- ae_data %>%
+        group_by(siteid.x) %>%
+        summarize(
+            ae_count = sum(!is.na(studyid.y), na.rm = TRUE),  # Count AEs
+            subject_count = n_distinct(subjid),  # Count distinct subjects
+            sae_count = sum(aeser == "Y", na.rm = TRUE),  # Count serious adverse events
+            .groups = 'drop'  # Drop grouping after summarization
+        )
+  
+    ae_rates <- ae_counts %>%
+        left_join(total_days_by_site, by = "siteid.x") %>%  # Join to get total_days_on_study
+        mutate(
+            exposure_years = total_days_on_study / 365.25,  # Calculate exposure years
+            ae_per_patient_year = ae_count / exposure_years,  # Calculate AE rate per patient year
+            sae_per_patient_year = sae_count / exposure_years  # Calculate SAE rate per patient year
+        )
+  
+    overall_stats <- ae_rates %>%
+        summarize(
+            total_ae = sum(ae_count),
+            total_sae = sum(sae_count),
+            total_exposure = sum(exposure_years),
+            overall_ae_rate = total_ae / total_exposure,
+            overall_sae_rate = total_sae / total_exposure,
+            .groups = 'drop'
+        )
+  
+    # Calculate expected AEs and SAEs for SMR calculation
+    ae_rates <- ae_rates %>%
+        mutate(
+            expected_ae = overall_stats$overall_ae_rate * exposure_years,
+            expected_sae = overall_stats$overall_sae_rate * exposure_years,
+            ae_smr = ae_count / expected_ae,
+            sae_smr = sae_count / expected_sae
+        )
+  
+    # Calculate Poisson statistics and flags
+    ae_rates <- ae_rates %>%
+        mutate(
+            ae_adjusted_z = ifelse(ae_count == 0 & expected_ae == 0, 0,
+                sign(ae_count - expected_ae) * sqrt(2 * (
+                    ifelse(ae_count == 0, 0, ae_count * log(ae_count / expected_ae)) - 
+                    (ae_count - expected_ae)
+                ))
+            ),
+            sae_adjusted_z = ifelse(sae_count == 0 & expected_sae == 0, 0,
+                sign(sae_count - expected_sae) * sqrt(2 * (
+                    ifelse(sae_count == 0, 0, sae_count * log(sae_count / expected_sae)) -
+                    (sae_count - expected_sae)
+                ))
+            ),
+            # Flags based on test statistics and SMRs
+            ae_flag = case_when(
+                abs(ae_adjusted_z) > 3 & ae_smr > 1 ~ "High",
+                abs(ae_adjusted_z) > 3 & ae_smr < 1 ~ "Low",
+                abs(ae_adjusted_z) > 2 & ae_smr > 1 ~ "Elevated",
+                abs(ae_adjusted_z) > 2 & ae_smr < 1 ~ "Reduced",
+                TRUE ~ "Within Expected Range"
+            ),
+            sae_flag = case_when(
+                abs(sae_adjusted_z) > 3 & sae_smr > 1 ~ "High",
+                abs(sae_adjusted_z) > 3 & sae_smr < 1 ~ "Low",
+                abs(sae_adjusted_z) > 2 & sae_smr > 1 ~ "Elevated",
+                abs(sae_adjusted_z) > 2 & sae_smr < 1 ~ "Reduced",
+                TRUE ~ "Within Expected Range"
+            ),
+            ae_rate_ci_lower = qpois(0.025, ae_count) / exposure_years,
+            ae_rate_ci_upper = qpois(0.975, ae_count) / exposure_years,
+            sae_rate_ci_lower = qpois(0.025, sae_count) / exposure_years,
+            sae_rate_ci_upper = qpois(0.975, sae_count) / exposure_years,
+            ae_pvalue = ppois(
+                ifelse(ae_count <= expected_ae, ae_count, ae_count - 1),
+                expected_ae,
+                lower.tail = ae_count <= expected_ae
+            ),
+            sae_pvalue = ppois(
+                ifelse(sae_count <= expected_sae, sae_count, sae_count - 1),
+                expected_sae,
+                lower.tail = sae_count <= expected_sae
+            ),
+            ae_smr_ci_lower = (qchisq(0.025, 2 * ae_count) / 2) / expected_ae,
+            ae_smr_ci_upper = (qchisq(0.975, 2 * (ae_count + 1)) / 2) / expected_ae,
+            sae_smr_ci_lower = (qchisq(0.025, 2 * sae_count) / 2) / expected_sae,
+            sae_smr_ci_upper = (qchisq(0.975, 2 * (sae_count + 1)) / 2) / expected_sae
+        )
+    
+    # Return results as a list
+    return(list(
+        data = ae_rates,
+        overall_stats = overall_stats,
+        flags = list(
+            sites_flagged_ae = sum(ae_rates$ae_flag != "Within Expected Range"),
+            sites_flagged_sae = sum(ae_rates$sae_flag != "Within Expected Range")
+        )
+    ))
+}
+
+
+ae_analysis <- analyze_adverse_events(rawplus_ae, rawplus_dm)
+```
+
+```{r}
+# Function to plot adverse events
+plot_adverse_events <- function(ae_results) {
+  # Extract the data from the results
+  plot_data <- ae_results$data
+  
+  # Create the scatter plot
+  ggplot(plot_data, aes(x = exposure_years, y = ae_count)) +
+    # Add points
+    geom_point(aes(color = ae_flag), size = 3, alpha = 0.7) +
+    # Add labels for outlier sites
+    # Add a trend line
+    geom_smooth(method = "lm", se = TRUE, color = "grey50", linetype = "dashed") +
+    # Customize colors
+    scale_color_manual(
+      values = c(
+        "High" = "red",
+        "Elevated" = "orange",
+        "Within Expected Range" = "blue",
+        "Reduced" = "lightblue",
+        "Low" = "purple"
+      )
+    ) +
+    # Add labels and title
+    labs(
+      title = "Adverse Events vs Time on Study",
+      x = "Exposure Time (Years)",
+      y = "Number of Adverse Events",
+      color = "Site Status"
+    ) +
+    # Customize theme
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.title = element_text(size = 12),
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold")
+    )
+}
+
+# Usage example:
+ae_plot <- plot_adverse_events(ae_analysis)
+print(ae_plot)
+```
+
+QTLs
+
+QTLs \# Quality Tolerance Limit (QTL) Analysis Function
+
+```{r}
+calculate_qtl <- function(data, metric_col) {
+    # Validate that the specified metric column is numeric
+    if (!is.numeric(data[[metric_col]])) {
+        stop("Metric column must be numeric")
+    }
+
+    # Using percentiles for range-based QTL calculation
+    lower_limit <- quantile(data[[metric_col]], 0.10, na.rm = TRUE) #10th percentile 
+    secondary_limit_45 <- quantile(data[[metric_col]], 0.45, na.rm = TRUE)  # 45th percentile
+    upper_limit <- quantile(data[[metric_col]], 0.90, na.rm = TRUE)  # 90th percentile
+    
+    # Ensure the 75th percentile is less than the 90th percentile
+    if (secondary_limit_45 >= upper_limit) {
+        stop("45th percentile limit must be less than 90th percentile limit.")
+    }
+
+    # Add a new column to flag sites outside QTL limits
+    data <- data %>%
+        mutate(
+            qtl_status = case_when(
+                !!sym(metric_col) < lower_limit ~ "Below QTL",
+                !!sym(metric_col) > upper_limit ~ "Above QTL",
+                !!sym(metric_col) > secondary_limit_45 ~ "Above 45th Percentile", 
+                TRUE ~ "Within QTL"
+            )
+        )
+
+    return(list(
+        data = data,                 # Updated data with QTL status
+        lower_limit = lower_limit,   # Lower threshold limit
+        secondary_limit_45 = secondary_limit_45,  # Upper limit for 45th percentile
+        upper_limit = upper_limit   # Upper threshold limit
+    ))
+}
+```
+
+# Example QTL analysis functions for different metrics
+
+```{r}
+qtl_protocol_deviations <- function(ctms_protdev, rawplus_dm) {
+    qtl_pd_data <- rawplus_dm %>%
+    left_join(ctms_protdev, by = "subjid") %>%
+    mutate(
+        # Convert deviation date to Date type 
+        deviation_date = as.Date(deviationdate),
+        # Convert timeonstudy to years 
+        study_time = timeonstudy / 365.25 
+    )
+
+    # Cumulative calculations by study_time 
+    qtl_overall_stats <- qtl_pd_data %>%
+        arrange(study_time) %>%
+        group_by(study_time) %>%
+        summarize(
+            total_pd = sum(!is.na(deviation_date)),  # Count deviations only for rows with a deviation date
+            participants = n_distinct(subjid),  # Count all unique participants up to each time point
+            .groups = 'drop'
+        ) %>%
+        mutate(
+            cumulative_pd = cumsum(total_pd),  # Calculate cumulative PD
+            cumulative_participants = cumsum(participants),  # Calculate cumulative participant count
+            cumulative_pd_rate = cumulative_pd / cumulative_participants  # Calculate PD rate per cumulative participants
+        ) %>%
+        ungroup()
+
+    # Calculate QTLs for overall protocol deviation rate
+    qtl_overall <- calculate_qtl(qtl_overall_stats, "cumulative_pd_rate")
+    
+    # Return the calculated QTLs and overall statistics
+    return(list(
+        overall_qtl = qtl_overall,
+        overall_stats = qtl_overall_stats
+    ))
+}
+
+# Run QTL analysis for protocol deviations
+qtl_pd_analysis <- qtl_protocol_deviations(ctms_protdev, rawplus_dm)
+```
+
+```{r}
+plot_qtl <- function(qtl_result, overall_stats) {
+    # Ensure the QTL limits are accessible
+    lower_limit <- qtl_result$lower_limit
+    upper_limit <- qtl_result$upper_limit
+    secondary_limit_45 <- qtl_result$secondary_limit_45
+    
+    # Create the plot
+    p <- ggplot(overall_stats, aes(x = study_time, y = cumulative_pd_rate)) +
+        geom_line(color = "darkgrey", size = 1) +  # Line for cumulative PD rate over study time
+        geom_hline(yintercept = lower_limit, linetype = "dashed", color = "blue") +
+        geom_hline(yintercept = upper_limit, linetype = "dashed", color = "red") +
+        geom_hline(yintercept = secondary_limit_45, linetype = "dashed", color = "orange") +
+        labs(
+            title = "Cumulative Protocol Deviations Rate vs. Study Time",
+            x = "Study Time (Years)",
+            y = "Cumulative Protocol Deviations Rate",
+            color = "QTL Status"
+        ) +
+        theme_minimal() +
+        theme(
+            plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+            axis.title = element_text(size = 12),
+            axis.text.x = element_text(angle = 45, hjust = 1)  # Adjust x-axis text for better visibility
+        )
+    
+    return(p)
+}
+
+# Usage example
+qtl_plot <- plot_qtl(qtl_pd_analysis$overall_qtl, qtl_pd_analysis$overall_stats)
+print(qtl_plot)
+```
+
+QTL for withdraws
+
+```{r}
+qtl_withdraws <- function(rawplus_ex, rawplus_dm) {
+    # Prepare data by merging all participants with their withdrawal status
+    withdraw_counts <- rawplus_ex %>%
+        group_by(subjid) %>%
+        summarize(withdraw_count = sum(experm == "Y", na.rm = TRUE), .groups = 'drop')
+
+    # Join the withdrawal counts with rawplus_dm to include time on study for all participants
+    qtl_withdraw_data <- rawplus_dm %>%
+        left_join(withdraw_counts, by = "subjid") %>%
+        mutate(
+            withdraw_count = replace_na(withdraw_count, 0)  # Replace NA with 0 for participants without withdrawals
+        )
+    
+    # Calculate total number of participants
+    total_participants <- n_distinct(qtl_withdraw_data$subjid)
+
+    # Calculate accumulated withdrawal rates over total subjects
+    qtl_withdraw_stats <- qtl_withdraw_data %>%
+        group_by(year = floor(timeonstudy / 365.25)) %>%
+        summarize(
+            total_withdraws = sum(withdraw_count, na.rm = TRUE),  # Sum withdrawals
+            total_exposure_years = sum(timeonstudy / 365.25, na.rm = TRUE),  # Total exposure in years
+            accumulated_withdraw_rate = cumsum(total_withdraws) / total_participants,  # Withdrawal rate per total subjects
+            .groups = 'drop'  # Prevent grouping issues
+        )
+    
+    # Calculate QTLs for accumulated withdrawal rates
+    qtl_withdraw_overall <- calculate_qtl(qtl_withdraw_stats, "accumulated_withdraw_rate")
+    
+    # Combine QTL results with rates, assigning limits and statuses
+    qtl_withdraw_stats <- qtl_withdraw_stats %>%
+        mutate(
+            lower_limit = qtl_withdraw_overall$lower_limit, 
+            upper_limit = qtl_withdraw_overall$upper_limit,
+            secondary_limit_45 = qtl_withdraw_overall$secondary_limit_45,
+            qtl_status = case_when(
+                accumulated_withdraw_rate < lower_limit ~ "Below QTL",
+                accumulated_withdraw_rate >= lower_limit & accumulated_withdraw_rate <= secondary_limit_45 ~ "Within QTL",
+                accumulated_withdraw_rate > secondary_limit_45 & accumulated_withdraw_rate <= upper_limit ~ "Above 75th Percentile",
+                accumulated_withdraw_rate > upper_limit ~ "Above QTL"
+            )
+        )
+
+    # Return the calculated QTLs and overall statistics
+    return(list(
+        qtl_withdraw_rates = qtl_withdraw_stats,
+        overall_qtl = qtl_withdraw_overall
+    ))
+}
+
+# Run QTL analysis for withdrawals
+qtl_withdraw_analysis <- qtl_withdraws(rawplus_ex, rawplus_dm)
+```
+
+```{r}
+plot_qtl_withdraw <- function(qtl_result, withdraw_stats) {
+    # Ensure the QTL limits are accessible
+    lower_limit <- qtl_result$lower_limit
+    upper_limit <- qtl_result$upper_limit
+    secondary_limit_45 <- qtl_result$secondary_limit_45
+    
+    # Create the plot
+    p <- ggplot(withdraw_stats, aes(x = year, y = accumulated_withdraw_rate)) +
+        geom_line(color = "darkgrey", size = 1) +  # Line for accumulated withdrawal rate
+        geom_hline(yintercept = lower_limit, linetype = "dashed", color = "blue") +
+        geom_hline(yintercept = upper_limit, linetype = "dashed", color = "red") +
+        geom_hline(yintercept = secondary_limit_45, linetype = "dashed", color = "orange") +
+        labs(
+            title = "Accumulated Permanent Withdrawal Rates vs. Study Time",
+            x = "Study Time (Years)",
+            y = "Accumulated Permanent Withdrawal Rate"
+        ) +
+        theme_minimal() +
+        theme(
+            plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+            axis.title = element_text(size = 12)
+        )
+    
+    return(p)
+}
+
+# Usage example
+withdraw_plot <- plot_qtl_withdraw(qtl_withdraw_analysis$overall_qtl, qtl_withdraw_analysis$qtl_withdraw_rates)
+print(withdraw_plot)
+```
+
+```{r}
+# Plot cumulative withdrawals and exposure time
+ggplot(qtl_withdraw_analysis$qtl_withdraw_rates, aes(x = year)) +
+    geom_line(aes(y = total_withdraws, color = "Cumulative Withdraws"), size = 1) +
+    geom_line(aes(y = total_exposure_years * 100, color = "Total Exposure (scaled)"), size = 1, linetype = "dashed") +
+    labs(
+        title = "Cumulative Withdrawals and Total Exposure Over Time",
+        x = "Study Time (Years)",
+        y = "Count",
+        color = "Metrics"
+    ) +
+    theme_minimal()
+```
