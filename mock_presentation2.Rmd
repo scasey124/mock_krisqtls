@@ -182,7 +182,6 @@ pd_analysis <- analyze_protocol_deviations(ctms_protdev, rawplus_dm)
 Graph for KRI
 
 ```{r}
-# Assuming analyze_protocol_deviations() has been run and stored in 'results'
 plot_protocol_deviations <- function(pd_results) {
   # Extract the data from the results
   plot_data <- pd_results$data
@@ -221,7 +220,6 @@ plot_protocol_deviations <- function(pd_results) {
     )
 }
 
-# Usage example:
 pd_plot <- plot_protocol_deviations(pd_analysis)
 print(pd_plot)
 
@@ -389,7 +387,6 @@ plot_adverse_events <- function(ae_results) {
     )
 }
 
-# Usage example:
 ae_plot <- plot_adverse_events(ae_analysis)
 print(ae_plot)
 ```
@@ -507,7 +504,6 @@ plot_qtl <- function(qtl_result, overall_stats) {
     return(p)
 }
 
-# Usage example
 qtl_plot <- plot_qtl(qtl_pd_analysis$overall_qtl, qtl_pd_analysis$overall_stats)
 print(qtl_plot)
 ```
@@ -596,7 +592,6 @@ plot_qtl_withdraw <- function(qtl_result, withdraw_stats) {
     return(p)
 }
 
-# Usage example
 withdraw_plot <- plot_qtl_withdraw(qtl_withdraw_analysis$overall_qtl, qtl_withdraw_analysis$qtl_withdraw_rates)
 print(withdraw_plot)
 ```
